@@ -17,9 +17,11 @@ extern "C" {
 #endif  // __cplusplus
 
 #include <stdint.h>
+#include "aom_dsp/aom_dsp_common.h"
 #include "aom_dsp/grain_params.h"
 #include "aom_ports/mem.h"
 #include "aom_scale/yv12config.h"
+#include "aom_mem/aom_mem.h"
 
 /*!\brief Wrapper of data required to represent linear system of eqns and soln.
  */
@@ -147,6 +149,44 @@ void aom_flat_block_finder_extract_block(
     int w, int h, int stride, int offsx, int offsy, double *plane,
     double *block);
 
+static AOM_FORCE_INLINE void aom_update_mean_var(const int block_size, double block[], double *Gxx, double *Gxy, double *Gyy, double *mean, double *var) {
+  for (int yi = 1; yi < block_size - 1; ++yi) {
+    for (int xi = 1; xi < block_size - 1; ++xi) {
+      const double gx = (block[yi * block_size + xi + 1] -
+                        block[yi * block_size + xi - 1]) /
+                        2;
+      const double gy = (block[yi * block_size + xi + block_size] -
+                        block[yi * block_size + xi - block_size]) /
+                        2;
+      *Gxx += gx * gx;
+      *Gxy += gx * gy;
+      *Gyy += gy * gy;
+
+      // MSFT: uncomment the following to "fix" the issue
+      // const double value = block[yi * block_size + xi];
+      // *mean += value;
+      // *var += value * value;
+      *mean += block[yi * block_size + xi];
+      *var += block[yi * block_size + xi] * block[yi * block_size + xi];
+    }
+  }
+}
+
+typedef struct {
+  int index;
+  float score;
+} index_and_score_t;
+
+static AOM_INLINE int compare_scores(const void *a, const void *b) {
+  const float diff =
+      ((index_and_score_t *)a)->score - ((index_and_score_t *)b)->score;
+  if (diff < 0)
+    return -1;
+  else if (diff > 0)
+    return 1;
+  return 0;
+}
+
 /*!\brief Runs the flat block finder on the input data.
  *
  * Find flat blocks in the input image data. Returns a map of
@@ -154,9 +194,117 @@ void aom_flat_block_finder_extract_block(
  * when a block is determined to be flat. A higher value indicates a bigger
  * confidence in the decision.
  */
-int aom_flat_block_finder_run(const aom_flat_block_finder_t *block_finder,
+static int aom_flat_block_finder_run(const aom_flat_block_finder_t *block_finder,
                               const uint8_t *const data, int w, int h,
-                              int stride, uint8_t *flat_blocks);
+                              int stride, uint8_t *flat_blocks) {
+  // The gradient-based features used in this code are based on:
+  //  A. Kokaram, D. Kelly, H. Denman and A. Crawford, "Measuring noise
+  //  correlation for improved video denoising," 2012 19th, ICIP.
+  // The thresholds are more lenient to allow for correct grain modeling
+  // if extreme cases.
+  const int block_size = block_finder->block_size;
+  const int n = block_size * block_size;
+  const double kTraceThreshold = 0.15 / (32 * 32);
+  const double kRatioThreshold = 1.25;
+  const double kNormThreshold = 0.08 / (32 * 32);
+  const double kVarThreshold = 0.005 / (double)n;
+  const int num_blocks_w = (w + block_size - 1) / block_size;
+  const int num_blocks_h = (h + block_size - 1) / block_size;
+  int num_flat = 0;
+  int bx = 0, by = 0;
+  double *plane = (double *)aom_malloc(n * sizeof(*plane));
+  double *block = (double *)aom_malloc(n * sizeof(*block));
+  index_and_score_t *scores = (index_and_score_t *)aom_malloc(
+      num_blocks_w * num_blocks_h * sizeof(*scores));
+  if (plane == NULL || block == NULL || scores == NULL) {
+    fprintf(stderr, "Failed to allocate memory for block of size %d\n", n);
+    aom_free(plane);
+    aom_free(block);
+    aom_free(scores);
+    return -1;
+  }
+
+#ifdef NOISE_MODEL_LOG_SCORE
+  fprintf(stderr, "score = [");
+#endif
+  for (by = 0; by < num_blocks_h; ++by) {
+    for (bx = 0; bx < num_blocks_w; ++bx) {
+      // Compute gradient covariance matrix.
+      double Gxx = 0, Gxy = 0, Gyy = 0;
+      double var = 0;
+      double mean = 0;
+      aom_flat_block_finder_extract_block(block_finder, data, w, h, stride,
+                                          bx * block_size, by * block_size,
+                                          plane, block);
+
+      aom_update_mean_var(block_size, block, &Gxx, &Gxy, &Gyy, &mean, &var);
+
+      mean /= (block_size - 2) * (block_size - 2);
+
+      // Normalize gradients by block_size.
+      Gxx /= ((block_size - 2) * (block_size - 2));
+      Gxy /= ((block_size - 2) * (block_size - 2));
+      Gyy /= ((block_size - 2) * (block_size - 2));
+      var = var / ((block_size - 2) * (block_size - 2)) - mean * mean;
+
+      {
+        const double trace = Gxx + Gyy;
+        const double det = Gxx * Gyy - Gxy * Gxy;
+        const double e1 = (trace + sqrt(trace * trace - 4 * det)) / 2.;
+        const double e2 = (trace - sqrt(trace * trace - 4 * det)) / 2.;
+        const double norm = e1;  // Spectral norm
+        const double ratio = (e1 / AOMMAX(e2, 1e-6));
+        const int is_flat = (trace < kTraceThreshold) &&
+                            (ratio < kRatioThreshold) &&
+                            (norm < kNormThreshold) && (var > kVarThreshold);
+        // The following weights are used to combine the above features to give
+        // a sigmoid score for flatness. If the input was normalized to [0,100]
+        // the magnitude of these values would be close to 1 (e.g., weights
+        // corresponding to variance would be a factor of 10000x smaller).
+        // The weights are given in the following order:
+        //    [{var}, {ratio}, {trace}, {norm}, offset]
+        // with one of the most discriminative being simply the variance.
+        const double weights[5] = { -6682, -0.2056, 13087, -12434, 2.5694 };
+        double sum_weights = weights[0] * var + weights[1] * ratio +
+                             weights[2] * trace + weights[3] * norm +
+                             weights[4];
+        // clamp the value to [-25.0, 100.0] to prevent overflow
+        sum_weights = fclamp(sum_weights, -25.0, 100.0);
+        const float score = (float)(1.0 / (1 + exp(-sum_weights)));
+        flat_blocks[by * num_blocks_w + bx] = is_flat ? 255 : 0;
+        scores[by * num_blocks_w + bx].score = var > kVarThreshold ? score : 0;
+        scores[by * num_blocks_w + bx].index = by * num_blocks_w + bx;
+#ifdef NOISE_MODEL_LOG_SCORE
+        fprintf(stderr, "%g %g %g %g %g %d ", score, var, ratio, trace, norm,
+                is_flat);
+#endif
+        num_flat += is_flat;
+      }
+    }
+#ifdef NOISE_MODEL_LOG_SCORE
+    fprintf(stderr, "\n");
+#endif
+  }
+#ifdef NOISE_MODEL_LOG_SCORE
+  fprintf(stderr, "];\n");
+#endif
+  // Find the top-scored blocks (most likely to be flat) and set the flat blocks
+  // be the union of the thresholded results and the top 10th percentile of the
+  // scored results.
+  qsort(scores, num_blocks_w * num_blocks_h, sizeof(*scores), &compare_scores);
+  const int top_nth_percentile = num_blocks_w * num_blocks_h * 90 / 100;
+  const float score_threshold = scores[top_nth_percentile].score;
+  for (int i = 0; i < num_blocks_w * num_blocks_h; ++i) {
+    if (scores[i].score >= score_threshold) {
+      num_flat += flat_blocks[scores[i].index] == 0;
+      flat_blocks[scores[i].index] |= 1;
+    }
+  }
+  aom_free(block);
+  aom_free(plane);
+  aom_free(scores);
+  return num_flat;
+}
 
 // The noise shape indicates the allowed coefficients in the AR model.
 enum {
